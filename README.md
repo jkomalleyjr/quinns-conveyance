@@ -1,47 +1,75 @@
-# Quinn's Conveyance — x402 Pay-Per-Call Reference Implementation
+# Quinn's Conveyance
 
-Live demo: https://demo.quinnsconveyance.com
+**Your API gets paid every time an AI agent calls it.**
 
-This is the reference implementation behind [Quinn's Conveyance](https://demo.quinnsconveyance.com) — agent payment infrastructure that puts any API behind **HTTP 402** so AI agents pay per call in USDC. No API keys, no accounts, no signup.
+Quinn's Conveyance puts APIs behind [HTTP 402](https://www.x402.org) (the x402 protocol) so agents pay per call in USDC on Base — no API keys to issue, no signup forms, no cards, no invoicing, no billing stack to build. The wallet is the identity; the payment is the authorization.
 
-## How it works
+This repo is the working proof: the live demo's source, and the SDK we ship to clients.
 
-1. An AI agent calls a paid MCP tool.
-2. The server answers with an **x402 payment challenge**: price ($0.005), wallet address, and chain (Base mainnet).
-3. The agent signs an **EIP-3009 authorization** — signing costs zero gas; the agent never needs ETH.
-4. A facilitator verifies the signature and settles the USDC transfer on-chain.
-5. The server returns the answer.
+## Live proof
 
-Proof of real mainnet settlement: [Basescan](https://basescan.org/tx/0xb762d7856c03fc009b4743859850e075b997ea90d36a68681348e9634b0634f0)
+- **Demo** — an MCP server with 5 paid tools at $0.005/call: [demo.quinnsconveyance.com](https://demo.quinnsconveyance.com)
+- **Insights** — every challenge and settlement, public: [demo.quinnsconveyance.com/insights](https://demo.quinnsconveyance.com/insights)
+- **Settlement proof** — a real mainnet payment, settled via Coinbase CDP: [Basescan](https://basescan.org/tx/0x94de5713bf6973e5415dace7e15bd8bc937cc05a764cd4ae41d5da75ab754b07)
+- **Listings** — Coinbase Bazaar + Agentic.market (all 5 tools), MCP Registry (`io.github.jkomalleyjr/quinns-conveyance`), PayAI Bazaar
 
-## Run it
+## The SDK — `quinns-x402`
+
+The same code the demo runs, packaged. Paywall an Express API or an MCP server in minutes:
 
 ```bash
-npm install
-cp .env.example .env   # set X402_PAY_TO to your Base wallet address
-npm start              # serves :4021 — GET /health (free), POST /mcp (StreamableHTTP)
+npm install quinns-x402
 ```
 
-## Structure
+```ts
+import { x402, createSettlementLogger } from "quinns-x402";
 
-- `server.ts` — Express + StreamableHTTP MCP server. Free tools (`ping`, `list_topics`) and paid tools (one per snippet-library entry, $0.005/call via `@x402/mcp` payment wrapper). Serves the landing page at `/` and machine-readable docs at `/llms.txt`.
-- `snippet-library.json` — the knowledge base. Each entry becomes a paid tool. Swap in your own content.
-- `client-test.ts` / `client-remote.ts` — test clients (local and remote).
-- `.env.example` — required environment variables.
+const logger = createSettlementLogger(process.env.DATABASE_URL!, { verify: true });
 
-## Key implementation notes
+app.use(x402({
+  payTo: "0xYourBaseWallet",               // settlements land here, directly
+  price: "$0.005",
+  resourceBaseUrl: "https://api.yourco.com",
+  routes: { "GET /api/weather": { description: "Current weather for a city" } },
+  onChallenge: logger.onChallenge,
+  onSettlement: logger.onSettlement,
+}));
+```
 
-- **TypeScript, not Python**: the per-tool `createPaymentWrapper` pattern only exists in `@x402/mcp` (TypeScript). Python's x402 SDK has HTTP middleware only.
-- **Validate args before the payment wrapper**: unpaid calls with invalid args must still return the 402 challenge, not a validation error.
-- **Per-connection MCP server instances**: the `@modelcontextprotocol/sdk` singleton crashes on the second SSE/HTTP connection — create one server per connection.
-- **Facilitators**: `https://x402.org/facilitator` is testnet-only. For Base mainnet, use a mainnet-capable facilitator (this demo uses PayAI's — no API key required).
+What you get beyond the official `@x402` packages:
+
+- **Dual facilitators** — Coinbase CDP (JWT auth) or PayAI, one config line
+- **Discovery built in** — Bazaar extension declared automatically; your endpoints index after their first paid call
+- **A settlement ledger** — every 402 challenge and settlement in Postgres: payer wallet, amount, latency, conversion funnel
+- **Verification on every settlement** — Flow Executor's 4 checks (signature, nonce, transfer log, validity window) recorded as `verify_status`, fail-open-but-loud, with a delayed re-check that corrects propagation-race false failures
+
+Full docs: [sdk/README.md](sdk/README.md) · npm: [quinns-x402](https://www.npmjs.com/package/quinns-x402)
+
+## How the demo works
+
+[`demo/server.ts`](demo/server.ts) — an Express + MCP (StreamableHTTP) server. Paid calls flow: **402 challenge → EIP-3009 signed authorization → facilitator settlement on Base → response**. Settlements are logged to Postgres, verified, and rendered on the public Insights dashboard. Payments settle **directly to the operator's wallet** — the service never holds funds.
 
 ## Services
 
-Want this pattern on your API? Fixed-scope implementations:
+| | |
+| --- | --- |
+| **Implementation** | **$500 flat** — one API behind 402, dual facilitators, MCP wrapper, registry/Bazaar listings, settlement logging. Waived with a 12-month Operate plan. |
+| **Operate Core** | **$150/mo** — settlement logging & monitoring, facilitator failover, monthly agent-traffic report. |
+| **Operate Insights** | **$350/mo** — Core plus the live analytics dashboard. |
 
-- **Starter ($750)** — one endpoint behind 402, wallet setup, verified settlement. Live in under a week.
-- **Standard ($1,800)** — up to 5 endpoints, MCP wrapper, registry listings.
-- **Care plan ($150/mo)** — monitoring, facilitator updates, settlement reconciliation.
+**Pilot program (3 slots):** free implementation + 90 days of Operate Insights, in exchange for a logo, a quote, and a case study with real numbers. Terms: [sales/pilot-agreement.md](sales/pilot-agreement.md) · [sales/pilot-offer.md](sales/pilot-offer.md)
 
-Contact: john@quinnsconveyance.com
+## Writing
+
+- [I put an MCP server behind HTTP 402 — here's the exact setup](https://dev.to/johnnyko/i-put-an-mcp-server-behind-http-402-heres-the-exact-setup-2094)
+- [How We'll Measure the Agent Economy](https://dev.to/johnnyko/how-well-measure-the-agent-economy-415k) — the four-layer ruler we run: challenge→settlement funnel, wallet persistence, latency shape, verify_status on every settlement.
+
+## Principles
+
+- **No custody, ever.** Settlements go straight to the API owner's wallet.
+- **Customer data is never sold.** The settlement database exists to operate and improve the service — it is not a data product.
+- **Measure commerce, not transaction counts.**
+
+## Contact
+
+john@quinnsconveyance.com · [quinnsconveyance.com](https://quinnsconveyance.com) · X: [@JkomalleyjrO](https://x.com/JkomalleyjrO)
