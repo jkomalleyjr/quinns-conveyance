@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
 import { createPaymentWrapper, x402ResourceServer } from "@x402/mcp";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
@@ -67,7 +68,9 @@ function zodShapeToJsonSchema(parameters: Record<string, z.ZodTypeAny>): Record<
  * Build a paid MCP server factory. Mirrors the Quinn's Conveyance demo pattern:
  * per-tool createPaymentWrapper, bazaar discovery extension per tool so the
  * facilitator's catalog indexes every tool after a paid call, and settlement
- * hooks normalized into ChallengeEvent/SettlementEvent.
+ * hooks normalized into ChallengeEvent/SettlementEvent. Challenge events are
+ * detected at the transport layer (the @x402/mcp server wrapper exposes no
+ * working server-side challenge hook — see detectChallenges below).
  *
  * ```ts
  * import { createPaidMcpServer } from "quinns-x402";
@@ -108,29 +111,63 @@ export async function createPaidMcpServer(config: PaidMcpConfig): Promise<PaidMc
   // challenge → settlement latency correlation, keyed by tool name
   const challengeTs = new Map<string, number>();
 
-  const baseHooks = {
-    onPaymentRequired: async ({ toolName, arguments: args, paymentRequired }: any) => {
-      try {
-        const priceRaw =
-          paymentRequired?.accepts?.[0]?.amount ?? accepts[0]?.amount ?? "0";
-        const event: ChallengeEvent = {
-          surface: "mcp",
-          resource: toolName,
-          priceUsdc: Number(priceRaw) / 1e6,
-          ip: "unknown",
-          userAgent: "unknown",
-          sessionId: "unknown",
-          args,
-          at: new Date(),
-        };
-        challengeTs.set(toolName, Date.now());
-        await runCallbacks(config.onChallenge, async (cb) => {
-          await cb(event);
-        });
-      } catch (e) {
-        console.error("[quinns-x402] challenge callback failed (fail-open):", (e as Error).message);
+  // --- Challenge detection (transport layer).
+  // The x402 MCP wrapper answers unpaid paid-tool calls with a 402 challenge
+  // (HTTP 200, MCP-level error carrying the x402 payload) — but it invokes
+  // no server-side hook on that path, so this layer sees every challenge.
+  // A tools/call to a paid tool WITHOUT the "x402/payment" params._meta
+  // entry is a fresh challenge: stamp challengeTs (for latency) and fire
+  // onChallenge callbacks. Paid retries carry _meta["x402/payment"] and are
+  // not logged. Fire-and-forget and fail-open: detection never delays or
+  // breaks the MCP response. This is the ONLY challenge writer — no
+  // double-logging path exists.
+  const paidToolNames = new Set(config.tools.map((t) => t.name));
+  const X402_PAYMENT_META = "x402/payment";
+
+  function recordChallenge(toolName: string, args: unknown, extra: any) {
+    const event: ChallengeEvent = {
+      surface: "mcp",
+      resource: toolName,
+      priceUsdc: Number(accepts[0]?.amount ?? "0") / 1e6,
+      ip: "unknown",
+      userAgent: headerValue(extra?.requestInfo?.headers, "user-agent") ?? "unknown",
+      sessionId: typeof extra?.sessionId === "string" ? extra.sessionId : "unknown",
+      args,
+      at: new Date(),
+    };
+    challengeTs.set(toolName, Date.now());
+    void runCallbacks(config.onChallenge, async (cb) => {
+      await cb(event);
+    });
+  }
+
+  function detectChallenges(message: any, extra: any) {
+    try {
+      if (!message) return;
+      const msgs = Array.isArray(message) ? message : [message];
+      for (const m of msgs) {
+        if (!m || typeof m !== "object") continue;
+        if (m.method !== "tools/call") continue;
+        const name = m.params?.name;
+        if (typeof name !== "string" || !paidToolNames.has(name)) continue;
+        const meta = m.params?._meta;
+        const paid = meta && typeof meta === "object" && meta[X402_PAYMENT_META] != null;
+        if (paid) continue;
+        recordChallenge(name, m.params?.arguments ?? {}, extra);
       }
-    },
+    } catch (e) {
+      console.error("[quinns-x402] challenge detection failed (fail-open):", (e as Error).message);
+    }
+  }
+
+  // NOTE: no onPaymentRequired hook here. The @x402/mcp SERVER wrapper only
+  // ever invokes onBeforeExecution / onAfterExecution / onAfterSettlement —
+  // onPaymentRequired is a CLIENT-side hook (registered on the paying client
+  // to receive challenges), so wiring it server-side accepts silently and
+  // never runs (the wrapper returns the 402 result without touching hooks
+  // when no payment is present). Challenges are therefore detected at the
+  // transport layer in createServer() below — see detectChallenges().
+  const baseHooks = {
     onAfterSettlement: async ({ settlement, toolName, arguments: args, paymentPayload, paymentRequirements }: any) => {
       try {
         const tx = settlement?.transaction ?? "unknown";
@@ -177,7 +214,6 @@ export async function createPaidMcpServer(config: PaidMcpConfig): Promise<PaidMc
     // resource.url as the callable endpoint, so it must be the public HTTPS
     // MCP URL. Re-inject the real tool name in the hooks.
     const toolHooks = {
-      onPaymentRequired: (ctx: any) => baseHooks.onPaymentRequired({ ...ctx, toolName: tool.name }),
       onAfterSettlement: (ctx: any) => baseHooks.onAfterSettlement({ ...ctx, toolName: tool.name }),
     };
     const parameters = tool.parameters ?? defaultParameters;
@@ -200,6 +236,20 @@ export async function createPaidMcpServer(config: PaidMcpConfig): Promise<PaidMc
     });
   };
 
+  function headerValue(headers: any, name: string): string | undefined {
+    try {
+      if (!headers) return undefined;
+      if (typeof headers.get === "function") {
+        const v = headers.get(name);
+        return v == null ? undefined : String(v);
+      }
+      const v = headers[name] ?? headers[name.toLowerCase()];
+      return v == null ? undefined : String(Array.isArray(v) ? v[0] : v);
+    } catch {
+      return undefined;
+    }
+  }
+
   function createServer(): McpServer {
     const mcpServer = new McpServer({
       name: config.name ?? "quinns-x402",
@@ -219,6 +269,22 @@ export async function createPaidMcpServer(config: PaidMcpConfig): Promise<PaidMc
         }),
       );
     }
+    // Wrap connect() so challenge detection rides the transport: after the
+    // MCP Protocol installs its onmessage handler, chain ours in front of it.
+    // Transports dispatch through the onmessage property at request time, so
+    // every inbound JSON-RPC message is inspected before handling. This runs
+    // for any transport (StreamableHTTP, stdio) without changing user code.
+    const originalConnect = mcpServer.connect.bind(mcpServer);
+    mcpServer.connect = async (transport: Transport) => {
+      await originalConnect(transport);
+      const protocolHandler = transport.onmessage;
+      if (typeof protocolHandler === "function") {
+        transport.onmessage = ((message: any, extra: any) => {
+          detectChallenges(message, extra);
+          return protocolHandler(message, extra);
+        }) as typeof transport.onmessage;
+      }
+    };
     return mcpServer;
   }
 

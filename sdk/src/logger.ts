@@ -15,6 +15,17 @@ export interface SettlementLoggerOptions {
    */
   verify?: boolean;
   verifyOptions?: VerifyOptions;
+  /**
+   * The instant verification races chain propagation — the verifier can read
+   * state before the settlement is visible to its node, producing false
+   * "failed" results (the signature is authorizationState/window FAILs
+   * seconds after a good settlement). When the first check comes back
+   * "failed", re-check once after this delay and replace the row if the
+   * re-check reaches a verdict, stamped with recheck provenance. A re-check
+   * that cannot reach a verdict never downgrades the original result.
+   * Default 30000. Set 0 to disable.
+   */
+  verifyRecheckDelayMs?: number;
 }
 
 export interface SettlementLogger {
@@ -114,6 +125,26 @@ export function createSettlementLogger(
         await updateVerifyStatus(e.txHash, vr.status, vr.detail, vr.verified);
       } catch (err) {
         console.error("[quinns-x402][ledger] verify update failed:", (err as Error).message);
+      }
+      // Delayed re-check: a definitive "failed" gets one retry after the
+      // propagation window (see verifyRecheckDelayMs). Mirrors the demo,
+      // where the +30s re-check flipped a raced "failed" to "verified".
+      const recheckDelayMs = opts.verifyRecheckDelayMs ?? 30_000;
+      if (vr.status === "failed" && recheckDelayMs > 0) {
+        const t = setTimeout(() => {
+          (async () => {
+            const vr2 = await verifySettlement(e, opts.verifyOptions);
+            if (vr2.status === "verified" || vr2.status === "failed") {
+              const label = `recheck@${Math.round(recheckDelayMs / 1000)}s: `;
+              try {
+                await updateVerifyStatus(e.txHash, vr2.status, label + vr2.detail, vr2.verified);
+              } catch (err) {
+                console.error("[quinns-x402][ledger] verify recheck update failed:", (err as Error).message);
+              }
+            }
+          })().catch(() => {});
+        }, recheckDelayMs);
+        (t as any).unref?.();
       }
     }
   };

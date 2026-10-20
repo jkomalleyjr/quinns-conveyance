@@ -98,6 +98,12 @@ await mcp.createServer().connect(transport);
 Tool parameters default to `{ query: z.string() }`; pass `parameters` (a zod
 shape) and `inputSchema` (JSON schema) for custom shapes.
 
+`onChallenge` works on this surface too: unpaid tool calls are detected at
+the transport layer (the `@x402/mcp` server wrapper exposes no server-side
+challenge hook — its `onPaymentRequired` is client-side only and never fires
+server-side), so your challenge callbacks and ledger rows fire for every 402
+served, exactly like the Express surface.
+
 ## Settlement ledger (optional, Postgres)
 
 `createSettlementLogger(connectionString, { verify })` returns
@@ -132,12 +138,22 @@ import { verifySettlement } from "quinns-x402";
 const result = await verifySettlement(settlementEvent); // { status, verified, detail }
 ```
 
+**Delayed re-check.** The instant check races chain propagation — the
+verifier may read state before the settlement is visible to its node,
+producing false `failed` results (typically authorizationState/window
+FAILs seconds after a good settlement). When the first check returns
+`failed`, the logger re-checks once after `verifyRecheckDelayMs`
+(default 30000, set 0 to disable) and replaces the row if the re-check
+reaches a verdict, with `verify_detail` stamped `recheck@30s: ...`. A
+re-check that can't reach a verdict never downgrades the original.
+
 ## Defaults (override anything)
 
 | Option | Default |
 | --- | --- |
 | `network` | `eip155:8453` (Base mainnet) |
 | `facilitatorUrl` | `https://facilitator.payai.network` |
+| `cdp` | unset — set `cdp: { keyId, keySecret }` (Coinbase CDP Secret API Key) to settle via the CDP facilitator instead; `facilitatorUrl` is then ignored |
 | `price` | `$0.005` |
 | `serviceName` | `"Quinn's Conveyance"` |
 | `payTo` | **required** — your Base wallet |
@@ -161,8 +177,8 @@ call.
 
 ## Publishing (manual step)
 
-This package is **not yet published to npm**. To publish (needs the owner's
-npm account):
+Published to npm as `quinns-x402` (0.1.0 is live; 0.1.1 staged). To publish a
+new version (needs the owner's npm account):
 
 ```bash
 npm run build

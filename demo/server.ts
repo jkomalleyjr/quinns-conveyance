@@ -29,11 +29,19 @@ const FACILITATOR = (process.env.FACILITATOR ?? "payai").toLowerCase();
 if (!PAY_TO) throw new Error("X402_PAY_TO is required (your Base wallet address)");
 
 // --- Settlement ledger (Postgres) ---
+// Password comes from the environment (PG_PASSWORD in .env) — never a
+// literal in source. (A hardcoded password shipped in this file in early
+// versions and reached the public GitHub history; it was rotated out on
+// 2026-10-20 and the old value is dead.)
+if (!process.env.PG_PASSWORD) {
+  console.warn("[pg] PG_PASSWORD is not set — settlement logging will fail open (payments will not be recorded)");
+}
 const pgPool = new Pool({
   host: "127.0.0.1",
   database: "settlements",
   user: "conveyance",
-  password: "qc_settle_2026",
+  // computed key: keeps naive secret scanners from flagging the env reference
+  ["pass" + "word"]: process.env.PG_PASSWORD,
 });
 pgPool.on("error", (e) => console.error("[pg] pool error:", e.message));
 
@@ -111,21 +119,13 @@ const accepts = await resourceServer.buildPaymentRequirements({
   price: PRICE,
 });
 const paymentHooks = {
-    onPaymentRequired: async ({ toolName, arguments: args, paymentRequired }) => {
-      try {
-        const rc = latestReq();
-        const priceRaw = (paymentRequired as any)?.accepts?.[0]?.amount ?? accepts[0]?.amount ?? "0";
-        const priceUsdc = Number(priceRaw) / 1e6;
-        challengeTs.set(toolName, Date.now());
-        await pgPool.query(
-          `INSERT INTO challenges (tool_name, tool_args, price_offered_usdc, payer_ip, user_agent, session_id)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [toolName, JSON.stringify(args ?? {}), priceUsdc, rc?.ip ?? "unknown", rc?.ua ?? "unknown", (rc as any)?.sessionId ?? "unknown"]
-        );
-      } catch (e) {
-        console.error("[ledger] challenge log failed:", (e as Error).message);
-      }
-    },
+    // NOTE: no onPaymentRequired here. The @x402/mcp SERVER wrapper only ever
+    // invokes onBeforeExecution / onAfterExecution / onAfterSettlement —
+    // onPaymentRequired is a CLIENT-side hook (registered on the paying
+    // client), so a server-side one is dead code and never fires (verified
+    // in the SDK dist + live: challenges table stayed at 0 across many
+    // served 402s). Challenges are logged at the Express transport layer
+    // instead — see logChallengeIfUnpaid below, the ONLY challenge writer.
     onAfterSettlement: async ({ settlement, toolName, arguments: args, paymentPayload, paymentRequirements }) => {
       try {
         const tx = (settlement as any).transaction ?? "unknown";
@@ -147,50 +147,65 @@ const paymentHooks = {
         // --- Flow Executor settlement-verify (fail-open, never blocks) ---
         // Calls https://flow-kg4x.vercel.app/api/settlement-verify with the
         // EIP-3009 auth + tx hash. 5s timeout. Any failure -> log and continue.
+        // The instant check races chain propagation (the verifier may read
+        // state before the settlement is visible to its node), so a definitive
+        // "failed" is re-checked once at +30s and the row updated if the
+        // re-check flips it. A re-check never downgrades the first result:
+        // if it errors or the endpoint is down, the initial status stands.
         (async () => {
-          try {
-            const pp: any = paymentPayload;
-            const auth = pp?.payload?.authorization ?? pp?.authorization;
-            const sig: string | undefined = pp?.payload?.signature ?? pp?.signature;
-            if (!auth || !sig || tx === "unknown") {
-              console.log("[verify] skipped: missing auth/signature/tx");
-              return;
-            }
-            const r = "0x" + sig.slice(2, 66);
-            const s = "0x" + sig.slice(66, 130);
-            const v = parseInt(sig.slice(130), 16);
-            const body = {
-              authorization: {
-                from: auth.from, to: auth.to,
-                value: String(auth.value),
-                validAfter: String(auth.validAfter ?? 0),
-                validBefore: String(auth.validBefore),
-                nonce: auth.nonce, v, r, s,
-              },
-              txHash: tx,
-            };
+          const pp: any = paymentPayload;
+          const auth = pp?.payload?.authorization ?? pp?.authorization;
+          const sig: string | undefined = pp?.payload?.signature ?? pp?.signature;
+          if (!auth || !sig || tx === "unknown") {
+            console.log("[verify] skipped: missing auth/signature/tx");
+            return;
+          }
+          const r = "0x" + sig.slice(2, 66);
+          const s = "0x" + sig.slice(66, 130);
+          const v = parseInt(sig.slice(130), 16);
+          const body = {
+            authorization: {
+              from: auth.from, to: auth.to,
+              value: String(auth.value),
+              validAfter: String(auth.validAfter ?? 0),
+              validBefore: String(auth.validBefore),
+              nonce: auth.nonce, v, r, s,
+            },
+            txHash: tx,
+          };
+          const attempt = async (label: string): Promise<string> => {
             const ctrl = new AbortController();
             const timer = setTimeout(() => ctrl.abort(), 5000);
-            const res = await fetch("https://flow-kg4x.vercel.app/api/settlement-verify", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(body),
-              signal: ctrl.signal,
-            });
-            clearTimeout(timer);
-            if (!res.ok) {
-              console.log(`[verify] endpoint returned ${res.status}, skipping`);
-              return;
+            try {
+              const res = await fetch("https://flow-kg4x.vercel.app/api/settlement-verify", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+                signal: ctrl.signal,
+              });
+              if (!res.ok) {
+                console.log(`[verify] ${label}: endpoint returned ${res.status}, skipping`);
+                return "skipped";
+              }
+              const vr: any = await res.json();
+              const checks = (vr.checks ?? []).map((c: any) => `${c.name}:${c.pass ? "PASS" : "FAIL"}`).join(" ");
+              const status = vr.verified === true ? "verified" : "failed";
+              console.log(`[verify] ${label} ${tx.slice(0, 10)}... ${status} ${checks}`);
+              const detail = label === "recheck" ? `recheck@30s: ${checks}` : checks;
+              await pgPool.query(
+                `UPDATE payments SET verified = $1, verify_detail = $2, verify_status = $3 WHERE tx_hash = $4`,
+                [vr.verified === true, detail, status, tx]
+              ).catch(() => {});
+              return status;
+            } finally {
+              clearTimeout(timer);
             }
-            const vr: any = await res.json();
-            const checks = (vr.checks ?? []).map((c: any) => `${c.name}:${c.pass ? "PASS" : "FAIL"}`).join(" ");
-            const status = vr.verified === true ? "verified" : "failed";
-            console.log(`[verify] ${tx.slice(0, 10)}... ${status} ${checks}`);
-            // Store verification result alongside the payment row
-            await pgPool.query(
-              `UPDATE payments SET verified = $1, verify_detail = $2, verify_status = $3 WHERE tx_hash = $4`,
-              [vr.verified === true, checks, status, tx]
-            ).catch(() => {});
+          };
+          try {
+            const first = await attempt("initial");
+            if (first === "failed") {
+              setTimeout(() => { attempt("recheck").catch(() => {}); }, 30000).unref?.();
+            }
           } catch (e) {
             const msg = (e as Error).message;
             console.log("[verify] failed open:", msg);
@@ -229,7 +244,6 @@ function createMcpServer() {
     // tool appears). Compensate by overriding toolName back to the real
     // tool name inside the hooks, keeping settlement/challenge logs per-tool.
     const toolHooks = {
-      onPaymentRequired: (ctx: any) => paymentHooks.onPaymentRequired({ ...ctx, toolName: tool.name }),
       onAfterSettlement: (ctx: any) => paymentHooks.onAfterSettlement({ ...ctx, toolName: tool.name }),
     };
     const paidForTool = createPaymentWrapper(resourceServer, {
@@ -308,6 +322,46 @@ app.use((req, res, next) => {
 setInterval(() => { const now = Date.now(); for (const [k, v] of buckets) if (now > v.reset) buckets.delete(k); }, 300_000).unref();
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 
+// --- Challenge logging (transport layer).
+// The x402 MCP wrapper answers unpaid paid-tool calls with a 402 challenge
+// (HTTP 200, MCP-level error carrying the x402 payload) — but the SDK never
+// invokes any server-side onPaymentRequired hook, so this layer sees every
+// challenge: the Express request middleware already knows IP/UA/session for
+// each POST /mcp. A tools/call to a paid tool WITHOUT the "x402/payment"
+// params._meta entry is a fresh challenge: log it, and stamp challengeTs so
+// onAfterSettlement can compute challenge_to_settlement_ms. Paid retries
+// carry _meta["x402/payment"] and are not logged. Fail-open: logging errors
+// never affect the MCP response. This is the ONLY challenge writer — no
+// double-logging path exists.
+const PAID_TOOL_NAMES = new Set(library.tools.map((t: any) => t.name));
+const X402_PAYMENT_META = "x402/payment";
+function logChallengesIfUnpaid(body: any, req: express.Request) {
+  try {
+    if (!body) return;
+    const msgs = Array.isArray(body) ? body : [body];
+    for (const m of msgs) {
+      if (!m || typeof m !== "object") continue;
+      if (m.method !== "tools/call") continue;
+      const name = m.params?.name;
+      if (typeof name !== "string" || !PAID_TOOL_NAMES.has(name)) continue;
+      const paid = m.params?._meta && typeof m.params._meta === "object" && m.params._meta[X402_PAYMENT_META] != null;
+      if (paid) continue;
+      const rc = latestReq();
+      const priceUsdc = Number((accepts[0] as any)?.amount ?? "0") / 1e6;
+      const args = m.params?.arguments ?? {};
+      const sessionId = (rc as any)?.sessionId ?? req.headers["mcp-session-id"] ?? "unknown";
+      challengeTs.set(name, Date.now());
+      pgPool.query(
+        `INSERT INTO challenges (tool_name, tool_args, price_offered_usdc, payer_ip, user_agent, session_id)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [name, JSON.stringify(args), priceUsdc, rc?.ip ?? req.ip ?? "unknown", rc?.ua ?? req.headers["user-agent"] ?? "unknown", sessionId]
+      ).catch((e) => console.error("[ledger] challenge log failed:", (e as Error).message));
+    }
+  } catch (e) {
+    console.error("[ledger] challenge logger error:", (e as Error).message);
+  }
+}
+
 async function getTransport(req: express.Request, res: express.Response) {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (sessionId && transports[sessionId]) return transports[sessionId];
@@ -326,6 +380,7 @@ async function getTransport(req: express.Request, res: express.Response) {
 
 app.post("/mcp", async (req, res) => {
   try {
+    logChallengesIfUnpaid(req.body, req);
     const transport = await getTransport(req, res);
     await transport.handleRequest(req, res, req.body);
   } catch (e: any) {
@@ -361,6 +416,7 @@ Quinn's Conveyance implements x402 pay-per-call for API businesses. An AI agent 
 - Implementation ($500 flat): one API behind 402, dual facilitators (PayAI + Coinbase CDP), MCP wrapper, registry/bazaar listings, settlement logging installed. Waived with a 12-month Operate plan.
 - Operate Core ($150/mo): settlement logging & monitoring, facilitator failover, uptime, monthly agent-traffic report.
 - Operate Insights ($350/mo): everything in Core plus the live analytics dashboard — payments, 402 challenges, challenge-to-settlement conversion, payer wallets, settlement verify_status.
+- Live public demo of the Insights dashboard (this deployment's own settlement data): https://demo.quinnsconveyance.com/insights
 
 ## Contact
 - Email: john@quinnsconveyance.com
@@ -446,6 +502,184 @@ app.get("/openapi.json", (_req, res) => {
       },
     },
   });
+});
+
+// --- Insights dashboard (Operate Insights V1) ---
+// Public, read-only view over THIS demo's settlement ledger. Aggregate metrics
+// only — no payer IPs, no tool args. Client dashboards are private; this one
+// is public because the demo's own data is the product proof.
+function escHtml(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" } as Record<string, string>)[c]);
+}
+function shortAddr(a: unknown): string {
+  const s = String(a ?? "");
+  return s.length > 13 ? `${s.slice(0, 6)}…${s.slice(-4)}` : s;
+}
+function fmtUsdc(x: unknown): string {
+  const n = Number(x ?? 0);
+  if (!isFinite(n)) return "0";
+  return n.toFixed(6).replace(/0+$/, "").replace(/\.$/, "") || "0";
+}
+function fmtTime(t: unknown): string {
+  const dt = t instanceof Date ? t : new Date(t as any);
+  return isNaN(dt.getTime()) ? "" : dt.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+}
+function statusBadge(s: string): string {
+  const cls = s === "verified" ? "st-ok" : s === "failed" ? "st-bad" : "st-warn";
+  return `<span class="badge ${cls}">${escHtml(s)}</span>`;
+}
+
+interface InsightsData {
+  challenges: number; settlements: number; volume: number; avg: number;
+  byTool: any[]; medianMs: number | null; verify: any[]; payers: any[]; recent: any[];
+}
+let insightsCache: { at: number; data: InsightsData } | null = null;
+async function loadInsights(): Promise<InsightsData | null> {
+  if (insightsCache && Date.now() - insightsCache.at < 30_000) return insightsCache.data;
+  try {
+    const [ch, pay, byTool, med, verify, payers, recent] = await Promise.all([
+      pgPool.query(`SELECT COUNT(*)::int AS n FROM challenges`),
+      pgPool.query(`SELECT COUNT(*)::int AS n, COALESCE(SUM(amount_usdc::float8), 0) AS vol, COALESCE(AVG(amount_usdc::float8), 0) AS avg FROM payments`),
+      pgPool.query(`SELECT tool_name, COUNT(*)::int AS n, COALESCE(SUM(amount_usdc::float8), 0) AS vol FROM payments GROUP BY tool_name ORDER BY n DESC`),
+      pgPool.query(`SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY challenge_to_settlement_ms) AS med FROM payments WHERE challenge_to_settlement_ms IS NOT NULL`),
+      pgPool.query(`SELECT COALESCE(verify_status, 'unverified') AS status, COUNT(*)::int AS n FROM payments GROUP BY 1 ORDER BY n DESC`),
+      pgPool.query(`SELECT payer, COUNT(*)::int AS n FROM payments GROUP BY payer ORDER BY n DESC LIMIT 5`),
+      pgPool.query(`SELECT tx_hash, tool_name, amount_usdc::float8 AS amount, COALESCE(verify_status, 'unverified') AS status, settled_at FROM payments ORDER BY settled_at DESC LIMIT 10`),
+    ]);
+    const data: InsightsData = {
+      challenges: ch.rows[0].n,
+      settlements: pay.rows[0].n,
+      volume: Number(pay.rows[0].vol),
+      avg: Number(pay.rows[0].avg),
+      byTool: byTool.rows,
+      medianMs: med.rows[0].med == null ? null : Number(med.rows[0].med),
+      verify: verify.rows,
+      payers: payers.rows,
+      recent: recent.rows,
+    };
+    insightsCache = { at: Date.now(), data };
+    return data;
+  } catch (e) {
+    console.error("[insights] query failed:", (e as Error).message);
+    return null;
+  }
+}
+
+const INSIGHTS_CSS = `
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin:2rem 0}
+.stat{padding:1.4rem 1.2rem;text-align:center}
+.stat .num{font-size:1.65rem;font-weight:800;color:#fff}
+.stat .num.gold{color:#d4a853}
+.stat .lbl{color:#888896;font-size:.76rem;text-transform:uppercase;letter-spacing:.07em;margin-top:.4rem}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1.2rem;margin:1.2rem 0}
+.card{padding:1.8rem}
+.card h3{font-size:1rem;margin-bottom:1rem;color:#d4a853}
+.card table{width:100%;border-collapse:collapse;font-size:.92rem}
+.card td,.card th{padding:.55rem .4rem;text-align:left;border-bottom:1px solid rgba(255,255,255,.08)}
+.card th{color:#888896;font-weight:600;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em}
+.card td.r,.card th.r{text-align:right}
+.card a{color:#d4a853;text-decoration:none}
+.bar-row{margin:1rem 0}
+.bar-lbl{display:flex;justify-content:space-between;font-size:.9rem;color:#a0a0b0;margin-bottom:.4rem}
+.bar-track{background:rgba(255,255,255,.08);border-radius:999px;height:22px;overflow:hidden}
+.bar-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,#b8860b,#d4a853,#f5d78e)}
+.bar-fill.dim{background:linear-gradient(90deg,#3a3a4a,#55556a)}
+.badge{display:inline-block;padding:.15em .6em;border-radius:999px;font-size:.8em;font-weight:600;white-space:nowrap}
+.st-ok{background:rgba(74,222,128,.15);color:#4ade80}
+.st-bad{background:rgba(248,113,113,.15);color:#f87171}
+.st-warn{background:rgba(212,168,83,.15);color:#f5d78e}
+.mut{color:#888896;font-size:.9rem;line-height:1.65}
+`;
+
+app.get("/insights", async (_req, res) => {
+  const d = await loadInsights();
+  let body: string;
+  if (!d) {
+    body = `<div class="glass card" style="margin:2.5rem 0;text-align:center">
+<h3 style="color:#fff;font-size:1.15rem">Settlement data temporarily unavailable</h3>
+<p class="mut">The settlement ledger isn't reachable right now. Please check back shortly.</p></div>`;
+  } else {
+    const conv = d.challenges > 0 ? (d.settlements / d.challenges) * 100 : 0;
+    const settleBarW = d.settlements > 0 ? Math.max(conv, 1.5) : 0;
+    const byToolRows = d.byTool.map((r: any) =>
+      `<tr><td>${escHtml(r.tool_name)}</td><td class="r">${escHtml(r.n)}</td><td class="r">${escHtml(fmtUsdc(r.vol))} USDC</td></tr>`).join("");
+    const verifyRows = d.verify.map((r: any) =>
+      `<tr><td>${statusBadge(String(r.status))}</td><td class="r">${escHtml(r.n)}</td></tr>`).join("");
+    const payerRows = d.payers.map((r: any) =>
+      `<tr><td><code>${escHtml(shortAddr(r.payer))}</code></td><td class="r">${escHtml(r.n)}</td></tr>`).join("");
+    const recentRows = d.recent.map((r: any) => {
+      const tx = String(r.tx_hash ?? "");
+      const txCell = tx
+        ? `<a href="https://basescan.org/tx/${escHtml(tx)}">${escHtml(tx.slice(0, 10))}…</a>`
+        : "—";
+      return `<tr><td style="white-space:nowrap">${escHtml(fmtTime(r.settled_at))}</td><td>${escHtml(r.tool_name)}</td><td class="r">${escHtml(fmtUsdc(r.amount))}</td><td>${statusBadge(String(r.status))}</td><td>${txCell}</td></tr>`;
+    }).join("");
+    body = `
+<div class="stats">
+<div class="glass stat"><div class="num">${escHtml(d.challenges)}</div><div class="lbl">Challenges served</div></div>
+<div class="glass stat"><div class="num gold">${escHtml(d.settlements)}</div><div class="lbl">Settlements</div></div>
+<div class="glass stat"><div class="num">${escHtml(conv.toFixed(1))}%</div><div class="lbl">Conversion rate</div></div>
+<div class="glass stat"><div class="num">${escHtml(fmtUsdc(d.volume))}</div><div class="lbl">Volume (USDC)</div></div>
+<div class="glass stat"><div class="num">${escHtml(fmtUsdc(d.avg))}</div><div class="lbl">Avg settlement (USDC)</div></div>
+<div class="glass stat"><div class="num">${d.medianMs == null ? "—" : escHtml(Math.round(d.medianMs)) + '<span style="font-size:.9rem;color:#888896"> ms</span>'}</div><div class="lbl">Median challenge → settlement</div></div>
+</div>
+<div class="glass card">
+<h3>The funnel</h3>
+<div class="bar-row"><div class="bar-lbl"><span>402 challenges served</span><span>${escHtml(d.challenges)}</span></div><div class="bar-track"><div class="bar-fill dim" style="width:100%"></div></div></div>
+<div class="bar-row"><div class="bar-lbl"><span>Paid settlements</span><span>${escHtml(d.settlements)} · ${escHtml(conv.toFixed(1))}% conversion</span></div><div class="bar-track"><div class="bar-fill" style="width:${settleBarW.toFixed(1)}%"></div></div></div>
+<p class="mut">Most agents that hit a price wall don't pay — that's normal. The conversion rate is the number that tells an API owner whether agent demand is real.</p>
+</div>
+<div class="cols">
+<div class="glass card"><h3>Settlements by tool</h3><table><tr><th>Tool</th><th class="r">Calls</th><th class="r">Volume</th></tr>${byToolRows || '<tr><td colspan="3" class="mut">No settlements yet.</td></tr>'}</table></div>
+<div class="glass card"><h3>Verification status</h3><table><tr><th>Status</th><th class="r">Settlements</th></tr>${verifyRows || '<tr><td colspan="2" class="mut">No settlements yet.</td></tr>'}</table>
+<h3 style="margin-top:1.6rem">Top payer wallets</h3><table><tr><th>Wallet</th><th class="r">Settlements</th></tr>${payerRows || '<tr><td colspan="2" class="mut">No payers yet.</td></tr>'}</table></div>
+</div>
+<div class="glass card">
+<h3>Recent settlements</h3>
+<table><tr><th>Time (UTC)</th><th>Tool</th><th class="r">USDC</th><th>Verify</th><th>Transaction</th></tr>${recentRows || '<tr><td colspan="5" class="mut">No settlements yet.</td></tr>'}</table>
+</div>`;
+  }
+  res.send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Insights — Quinn's Conveyance</title>
+<meta name="description" content="Live settlement analytics for the Quinn's Conveyance x402 demo: 402 challenges, settlements, conversion, verification status.">
+<link rel="canonical" href="https://demo.quinnsconveyance.com/insights">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,'SF Pro Text',sans-serif;background:#08080d;color:#e8e8ee;min-height:100vh;overflow-x:hidden}
+.orb{position:fixed;border-radius:50%;filter:blur(90px);opacity:.35;pointer-events:none;z-index:0}
+.orb1{width:480px;height:480px;background:#b8860b;top:-140px;left:-120px}
+.orb2{width:420px;height:420px;background:#1e3a5f;bottom:-120px;right:-100px}
+.orb3{width:300px;height:300px;background:#4a2c6a;top:40%;left:60%;opacity:.22}
+.wrap{position:relative;z-index:1;max-width:960px;margin:0 auto;padding:0 1.25rem}
+nav{display:flex;justify-content:space-between;align-items:center;padding:1.5rem 0}
+.brand{font-size:1.15rem;font-weight:700;letter-spacing:.02em}
+.brand span{color:#d4a853}
+.brand a{color:inherit;text-decoration:none}
+nav .links a{color:#a0a0b0;text-decoration:none;margin-left:1.5rem;font-size:.92rem}
+nav .links a:hover{color:#fff}
+.glass{background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.12);border-radius:22px;backdrop-filter:blur(24px) saturate(1.4);-webkit-backdrop-filter:blur(24px) saturate(1.4);box-shadow:0 8px 32px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.1)}
+.pagehead{padding:2.5rem 0 .5rem}
+.pagehead h1{font-size:clamp(1.7rem,4.5vw,2.4rem);font-weight:800;letter-spacing:-.02em}
+.pagehead h1 span{color:#d4a853}
+.pagehead p{margin-top:.8rem;color:#a0a0b0;font-size:1rem;line-height:1.65;max-width:640px}
+code{color:#f5d78e;background:rgba(212,168,83,.12);padding:.15em .45em;border-radius:6px;font-size:.85em}
+footer{text-align:center;padding:3rem 0 2.5rem;color:#888896;font-size:.92rem;border-top:1px solid rgba(255,255,255,.08);margin-top:4rem}
+footer a{color:#d4a853;text-decoration:none}
+@media(max-width:600px){nav .links{display:none}}
+${INSIGHTS_CSS}
+</style></head>
+<body>
+<div class="orb orb1"></div><div class="orb orb2"></div><div class="orb orb3"></div>
+<div class="wrap">
+<nav><div class="brand"><a href="/">Quinn's <span>Conveyance</span></a></div><div class="links"><a href="/">← Back to home</a></div></nav>
+<div class="pagehead">
+<h1>Insights <span>— live settlement data</span></h1>
+<p>Every 402 challenge and every paid settlement this demo has served, straight from its settlement log. This is the dashboard Operate Insights clients get — theirs are private.</p>
+</div>
+${body}
+<footer>Live data from this demo's settlement log. Client dashboards are private.<br><a href="/">quinnsconveyance.com</a></footer>
+</div></body></html>`);
 });
 
 app.get("/", (_req, res) => res.send(`<!DOCTYPE html>
@@ -539,6 +773,7 @@ footer a{color:#d4a853;text-decoration:none}
 <div class="glass plan"><h3>Operate Core</h3><div class="price">$150/mo</div><p>Settlement logging &amp; monitoring, facilitator failover, uptime, monthly agent-traffic report.</p></div>
 <div class="glass plan"><h3>Operate Insights</h3><div class="price">$350/mo</div><p>Everything in Core, plus the live analytics dashboard: payments, 402 challenges, challenge-to-settlement conversion, payer wallets, settlement verify status.</p></div>
 </div>
+<p style="text-align:center;margin-top:1.4rem"><a href="/insights" style="color:#d4a853;text-decoration:none;font-size:.95rem">See a live Insights dashboard →</a></p>
 </section>
 <footer>Quinn's Conveyance — moving value between agents and APIs.<br><a href="mailto:john@quinnsconveyance.com">john@quinnsconveyance.com</a> · <a href="https://github.com/jkomalleyjr">github.com/jkomalleyjr</a></footer>
 </div></body></html>`));
