@@ -1,6 +1,6 @@
-# Quinn's Conveyance
-
-**Your API gets paid every time an AI agent calls it.**
+<p align="center">
+  <img src="assets/banner.svg" alt="Quinn's Conveyance — Your API gets paid every time an AI agent calls it" width="100%">
+</p>
 
 Quinn's Conveyance puts APIs behind [HTTP 402](https://www.x402.org) (the x402 protocol) so agents pay per call in USDC on Base — no API keys to issue, no signup forms, no cards, no invoicing, no billing stack to build. The wallet is the identity; the payment is the authorization.
 
