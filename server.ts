@@ -10,6 +10,7 @@ import { z } from "zod";
 import { createPaymentWrapper, x402ResourceServer } from "@x402/mcp";
 import { HTTPFacilitatorClient } from "@x402/core/server";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
+import { Pool } from "pg";
 
 const PORT = Number(process.env.PORT ?? 4021);
 const PAY_TO = process.env.X402_PAY_TO;
@@ -18,6 +19,36 @@ const FACILITATOR_URL = process.env.FACILITATOR_URL ?? "https://x402.org/facilit
 const PRICE = process.env.X402_PRICE ?? "$0.005";
 
 if (!PAY_TO) throw new Error("X402_PAY_TO is required (your Base wallet address)");
+
+// --- Settlement ledger (Postgres) ---
+const pgPool = new Pool({
+  host: "127.0.0.1",
+  database: "settlements",
+  user: "conveyance",
+  password: "qc_settle_2026",
+});
+pgPool.on("error", (e) => console.error("[pg] pool error:", e.message));
+
+// --- Request context bridge: Express sees the HTTP layer (IP, UA),
+// the x402 hook does not. Keep a short ring buffer to correlate them. ---
+interface ReqCtx { ip: string; ua: string; at: number; }
+const recentReqs: ReqCtx[] = [];
+function recordReq(ip: string, ua: string) {
+  recentReqs.push({ ip, ua, at: Date.now() });
+  if (recentReqs.length > 50) recentReqs.shift();
+}
+function latestReq(): ReqCtx | null {
+  // settlement lands within seconds of the tool call; take the freshest
+  const now = Date.now();
+  for (let i = recentReqs.length - 1; i >= 0; i--) {
+    if (now - recentReqs[i].at < 30000) return recentReqs[i];
+  }
+  return null;
+}
+
+// --- Challenge tracking: log every 402, correlate with settlements ---
+// challengeTs maps toolName -> timestamp of last 402 for latency calc
+const challengeTs = new Map<string, number>();
 
 // --- Load the snippet library (draft; owner-verified entries only go live) ---
 const library = JSON.parse(readFileSync(new URL("./snippet-library.json", import.meta.url), "utf8"));
@@ -84,12 +115,135 @@ const accepts = await resourceServer.buildPaymentRequirements({
   payTo: PAY_TO,
   price: PRICE,
 });
-const paid = createPaymentWrapper(resourceServer, { accepts });
+const paid = createPaymentWrapper(resourceServer, {
+  accepts,
+  hooks: {
+    onPaymentRequired: async ({ toolName, arguments: args, paymentRequired }) => {
+      try {
+        const rc = latestReq();
+        const priceRaw = (paymentRequired as any)?.accepts?.[0]?.amount ?? accepts[0]?.amount ?? "0";
+        const priceUsdc = Number(priceRaw) / 1e6;
+        challengeTs.set(toolName, Date.now());
+        await pgPool.query(
+          `INSERT INTO challenges (tool_name, tool_args, price_offered_usdc, payer_ip, user_agent, session_id)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [toolName, JSON.stringify(args ?? {}), priceUsdc, rc?.ip ?? "unknown", rc?.ua ?? "unknown", (rc as any)?.sessionId ?? "unknown"]
+        );
+      } catch (e) {
+        console.error("[ledger] challenge log failed:", (e as Error).message);
+      }
+    },
+    onAfterSettlement: async ({ settlement, toolName, arguments: args, paymentPayload, paymentRequirements }) => {
+      try {
+        const tx = (settlement as any).transaction ?? "unknown";
+        const payer = (paymentPayload as any)?.payer ?? (settlement as any).payer ?? "unknown";
+        const amountRaw = (paymentRequirements as any)?.amount ?? accepts[0]?.amount ?? "0";
+        const amountUsdc = Number(amountRaw) / 1e6;
+        const priceOffered = Number(accepts[0]?.amount ?? "0") / 1e6;
+          const rc = latestReq();
+          const chTs = challengeTs.get(toolName);
+          const latencyMs = chTs ? Date.now() - chTs : null;
+          if (chTs) challengeTs.delete(toolName);
+          await pgPool.query(
+            `INSERT INTO payments (tx_hash, payer, payee, amount_usdc, tool_name, tool_args, price_offered_usdc, payer_ip, user_agent, challenge_to_settlement_ms, session_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (tx_hash) DO NOTHING`,
+            [tx, payer, PAY_TO, amountUsdc, toolName, JSON.stringify(args ?? {}), priceOffered, rc?.ip ?? "unknown", rc?.ua ?? "unknown", latencyMs, (rc as any)?.sessionId ?? "unknown"]
+          );
+        console.log(`[ledger] ${toolName} settled ${tx} -- $${amountUsdc} from ${payer}`);
+
+        // --- Flow Executor settlement-verify (fail-open, never blocks) ---
+        // Calls https://flow-kg4x.vercel.app/api/settlement-verify with the
+        // EIP-3009 auth + tx hash. 5s timeout. Any failure -> log and continue.
+        (async () => {
+          try {
+            const pp: any = paymentPayload;
+            const auth = pp?.payload?.authorization ?? pp?.authorization;
+            const sig: string | undefined = pp?.payload?.signature ?? pp?.signature;
+            if (!auth || !sig || tx === "unknown") {
+              console.log("[verify] skipped: missing auth/signature/tx");
+              return;
+            }
+            const r = "0x" + sig.slice(2, 66);
+            const s = "0x" + sig.slice(66, 130);
+            const v = parseInt(sig.slice(130), 16);
+            const body = {
+              authorization: {
+                from: auth.from, to: auth.to,
+                value: String(auth.value),
+                validAfter: String(auth.validAfter ?? 0),
+                validBefore: String(auth.validBefore),
+                nonce: auth.nonce, v, r, s,
+              },
+              txHash: tx,
+            };
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 5000);
+            const res = await fetch("https://flow-kg4x.vercel.app/api/settlement-verify", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+              signal: ctrl.signal,
+            });
+            clearTimeout(timer);
+            if (!res.ok) {
+              console.log(`[verify] endpoint returned ${res.status}, skipping`);
+              return;
+            }
+            const vr: any = await res.json();
+            const checks = (vr.checks ?? []).map((c: any) => `${c.name}:${c.pass ? "PASS" : "FAIL"}`).join(" ");
+            const status = vr.verified === true ? "verified" : "failed";
+            console.log(`[verify] ${tx.slice(0, 10)}... ${status} ${checks}`);
+            // Store verification result alongside the payment row
+            await pgPool.query(
+              `UPDATE payments SET verified = $1, verify_detail = $2, verify_status = $3 WHERE tx_hash = $4`,
+              [vr.verified === true, checks, status, tx]
+            ).catch(() => {});
+          } catch (e) {
+            const msg = (e as Error).message;
+            console.log("[verify] failed open:", msg);
+            // Mark as unverified (verifier unreachable) — the gap is visible, not silent
+            const isDown = msg.includes("abort") || msg.includes("fetch") || msg.includes("ECONNREFUSED") || msg.includes("timeout");
+            await pgPool.query(
+              `UPDATE payments SET verified = false, verify_detail = $1, verify_status = $2 WHERE tx_hash = $3`,
+              [`verifier unreachable: ${msg.slice(0, 100)}`, isDown ? "unverified_verifier_down" : "unverified_error", tx]
+            ).catch(() => {});
+          }
+        })();
+      } catch (e) {
+        console.error("[ledger] failed:", (e as Error).message);
+      }
+    },
+  },
+});
 
 // --- StreamableHTTP transport (works through tunnels/proxies; SSE does not).
 // One MCP server + transport per session, routed by Mcp-Session-Id.
 const app = express();
 app.use(express.json());
+app.use((req, _res, next) => {
+  if (req.path === "/mcp" && req.method === "POST") {
+    const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip || "unknown";
+    const sessionId = (req.headers["mcp-session-id"] as string) || "unknown";
+    recordReq(ip, (req.headers["user-agent"] as string) || "unknown");
+    const r = recentReqs[recentReqs.length - 1];
+    if (r) (r as any).sessionId = sessionId;
+  }
+  next();
+});
+app.set("trust proxy", true);
+
+// --- Per-IP rate limiter (paid calls are self-limiting: they cost the caller $0.005 each) ---
+const buckets = new Map<string, { count: number; reset: number }>();
+const RATE_LIMIT = 120, RATE_WINDOW_MS = 60_000; // 120 req/min per IP
+app.use((req, res, next) => {
+  const ip = (req.ip || "unknown").toString();
+  const now = Date.now();
+  let b = buckets.get(ip);
+  if (!b || now > b.reset) { b = { count: 0, reset: now + RATE_WINDOW_MS }; buckets.set(ip, b); }
+  if (++b.count > RATE_LIMIT) { res.status(429).json({ error: "rate limit exceeded, try again shortly" }); return; }
+  next();
+});
+setInterval(() => { const now = Date.now(); for (const [k, v] of buckets) if (now > v.reset) buckets.delete(k); }, 300_000).unref();
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 
 async function getTransport(req: express.Request, res: express.Response) {
@@ -152,6 +306,85 @@ Quinn's Conveyance implements x402 pay-per-call for API businesses. An AI agent 
 `));
 
 app.get("/health", (_req, res) => res.json({ status: "ok", network: NETWORK, price: PRICE }));
+
+// --- Machine-readable docs: structured JSON for agents ---
+// Agent manifest: everything an agent needs to discover, price, and pay for tools
+app.get("/.well-known/agent-manifest.json", (_req, res) => {
+  const tools = library.tools.map((t: any) => ({
+    name: t.name,
+    description: t.description,
+    price_usdc: Number((accepts[0] as any)?.amount ?? "5000") / 1e6,
+    currency: "USDC",
+    input_schema: { query: "string — your error message, question, or topic" },
+  }));
+  // free tools
+  tools.push(
+    { name: "ping", description: "Health check. Free.", price_usdc: 0, currency: "USDC", input_schema: {} },
+    { name: "list_topics", description: "List available paid tools. Free.", price_usdc: 0, currency: "USDC", input_schema: {} }
+  );
+  res.json({
+    name: "Quinn's Conveyance — x402 reference implementation",
+    url: "https://demo.quinnsconveyance.com",
+    mcp_endpoint: "https://demo.quinnsconveyance.com/mcp",
+    transport: "StreamableHTTP",
+    payment: {
+      protocol: "x402",
+      version: 2,
+      scheme: "exact",
+      network: NETWORK,
+      network_name: "Base",
+      asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      asset_name: "USDC",
+      pay_to: PAY_TO,
+      facilitator: FACILITATOR_URL,
+    },
+    auth: "none — payment is the authorization. No API keys, no signup.",
+    tools,
+    proof_of_settlement: "https://basescan.org/tx/0xb762d7856c03fc009b4743859850e075b997ea90d36a68681348e9634b0634f0",
+    services: {
+      starter: { price_usd: 750, description: "One endpoint behind 402, wallet setup, verified settlement." },
+      standard: { price_usd: 1800, description: "Up to 5 endpoints, MCP wrapper, registry listings." },
+      care_plan: { price_usd_per_month: 150, description: "Monitoring, facilitator updates, settlement reconciliation." },
+    },
+    contact: "john@quinnsconveyance.com",
+  });
+});
+
+// OpenAPI 3.1 spec for the HTTP surface
+app.get("/openapi.json", (_req, res) => {
+  res.json({
+    openapi: "3.1.0",
+    info: {
+      title: "Quinn's Conveyance — x402 Reference Implementation",
+      version: "1.0.0",
+      description: "Pay-per-call API via HTTP 402 + x402. No API keys — payment is the authorization.",
+    },
+    servers: [{ url: "https://demo.quinnsconveyance.com" }],
+    paths: {
+      "/health": {
+        get: {
+          summary: "Health check (free)",
+          responses: { "200": { description: "OK", content: { "application/json": { schema: { type: "object", properties: { status: { type: "string" }, network: { type: "string" }, price: { type: "string" } } } } } } },
+        },
+      },
+      "/mcp": {
+        post: {
+          summary: "MCP endpoint (StreamableHTTP). Paid tools return 402 with x402 challenge.",
+          description: "Send JSON-RPC MCP requests. Free tools: ping, list_topics. Paid tools ($0.005 USDC/call on Base): fix_comfyui_api_prompt_error, diagnose_comfyui_ops, check_dead_end, get_chaining_rule, get_audiobook_recipe.",
+          responses: {
+            "200": { description: "MCP response (or MCP-level error containing x402 payment challenge for unpaid paid-tool calls)" },
+          },
+        },
+      },
+      "/.well-known/agent-manifest.json": {
+        get: { summary: "Machine-readable agent manifest: tools, pricing, payment rails", responses: { "200": { description: "JSON manifest" } } },
+      },
+      "/llms.txt": {
+        get: { summary: "Human/LLM-readable description", responses: { "200": { description: "Markdown" } } },
+      },
+    },
+  });
+});
 
 app.get("/", (_req, res) => res.send(`<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
